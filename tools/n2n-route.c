@@ -17,13 +17,48 @@
  */
 
 
-#include "n2n.h"
+#include <errno.h>             // for errno
+#include <getopt.h>            // for getopt_long, optind, optarg
+#include <signal.h>            // for signal, SIGINT, SIGPIPE, SIGTERM, SIG_IGN
+#include <stdbool.h>
+#include <stdint.h>            // for uint8_t, uint16_t, uint32_t
+#include <stdio.h>             // for snprintf, printf, sscanf
+#include <stdlib.h>            // for calloc, free, atoi, EXIT_FAILURE, exit
+#include <string.h>            // for memset, NULL, memcmp, strchr, strcmp
+#include <sys/time.h>          // for timeval
+#include <time.h>              // for time, time_t
+#include <unistd.h>            // for getpid, STDIN_FILENO, _exit, geteuid
+#include "json.h"              // for _jsonpair, json_object_t, _jsonvalue
+#include "n2n.h"               // for inaddrtoa, traceEvent, TRACE_WARNING
+#include "random_numbers.h"    // for n2n_rand, n2n_seed, n2n_srand
+#include "uthash.h"            // for UT_hash_handle, HASH_ADD, HASH_DEL
 
+#ifdef __linux__
+#include <linux/netlink.h>     // for nlmsghdr, NLMSG_OK, NETLINK_ROUTE, NLM...
+#include <linux/rtnetlink.h>   // for RTA_DATA, rtmsg, RTA_GATEWAY, RTA_NEXT
+#endif
 
-#ifdef __linux__  /* currently, Linux only */
+#ifdef _WIN32
+#include <winsock.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>         // for inet_pton
+#include <net/if.h>            // for if_indextoname
+#include <net/route.h>         // for rtentry, RTF_GATEWAY, RTF_UP
+#include <netinet/in.h>        // for in_addr, sockaddr_in, htonl, htons, ntohl
+#include <sys/ioctl.h>         // for ioctl, SIOCADDRT, SIOCDELRT
+#include <sys/select.h>        // for select, FD_ISSET, FD_SET, FD_ZERO, fd_set
+#include <sys/socket.h>        // for send, socket, AF_INET, recv, connect
+#endif
 
-
-#include <net/route.h>
+#if defined (__linux__) || defined(_WIN64)  /*  currently, Linux and Windows only */
+/* Technically, this could be supported on some 32-bit windows.
+ * The assumption here is that a version of Windows new enough to
+ * support the features needed is probably running with 64-bit.
+ *
+ * The alternative is that people trying to run old games are probably on
+ * Windows XP and are probably 32-bit.
+ */
 
 
 #define WITH_ADDRESS            1
@@ -44,6 +79,13 @@
 #define ROUTE_DEL              1
 #define NO_DETECT              0
 #define AUTO_DETECT            1
+
+// REVISIT: may become obsolete
+#ifdef _WIN32
+#ifndef STDIN_FILENO
+#define STDIN_FILENO            _fileno(stdin)
+#endif
+#endif
 
 
 typedef struct n2n_route {
@@ -67,19 +109,39 @@ typedef struct n2n_route_conf {
 } n2n_route_conf_t;
 
 
-static int keep_running = 1;              /* for main loop, handled by signals */
+static bool keep_running = true;              /* for main loop, handled by signals */
 
 
 // -------------------------------------------------------------------------------------------------------
 // PLATFORM-DEPENDANT CODE
 
 
-// taken from https://stackoverflow.com/questions/4159910/check-if-user-is-root-in-c
 int is_privileged (void) {
 
+#if defined(__linux__)
+// taken from https://stackoverflow.com/questions/4159910/check-if-user-is-root-in-c
     uid_t euid = geteuid();
 
     return euid == 0;
+
+#elif defined(_WIN32)
+// taken from https://stackoverflow.com/a/10553065
+        int result;
+        DWORD rc;
+        wchar_t user_name[256];
+        USER_INFO_1 *info;
+        DWORD size = sizeof(user_name);
+
+        GetUserNameW(user_name, &size);
+        rc = NetUserGetInfo(NULL, user_name, 1, (unsigned char**)&info);
+        if (rc) {
+                return 0;
+        }
+        result = (info->usri1_priv == USER_PRIV_ADMIN);
+        NetApiBufferFree(info);
+
+        return result;
+#endif
 }
 
 
@@ -89,21 +151,20 @@ int is_privileged (void) {
 
 void set_term_handler(const void *handler) {
 
-#ifdef __linux__
+#if defined(__linux__)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, handler);
     signal(SIGINT, handler);
-#endif
-#ifdef WIN32 /* the beginning of Windows support ...? */
+#elif defined(_WIN32)
     SetConsoleCtrlHandler(handler, TRUE);
 #endif
 }
 
 
-#ifdef WIN32 /* the beginning of Windows support ...? */
-BOOL WINAPI term_handler (DWORD sig) {
-#else
+#ifndef _WIN32
 static void term_handler (int sig) {
+#else
+BOOL WINAPI term_handler (DWORD sig) {
 #endif
 
     static int called = 0;
@@ -116,8 +177,8 @@ static void term_handler (int sig) {
         called = 1;
     }
 
-    keep_running = 0;
-#ifdef WIN32 /* the beginning of Windows support ...? */
+    keep_running = false;
+#ifdef _WIN32
     return TRUE;
 #endif
 }
@@ -127,13 +188,15 @@ static void term_handler (int sig) {
 // PLATFORM-DEPENDANT CODE
 
 
-// taken from https://gist.github.com/javiermon/6272065
-// with modifications
-// originally licensed under GPLV2, Apache, and/or MIT
 
 #define RTLINK_BUFFER_SIZE 8192
 
 int find_default_gateway (struct in_addr *gateway_addr, struct in_addr *exclude) {
+
+#if defined(__linux__)
+    // taken from https://gist.github.com/javiermon/6272065
+    // with modifications
+    // originally licensed under GPLV2, Apache, and/or MIT
 
     int     ret = 0;
     int     received_bytes = 0, msg_len = 0, route_attribute_len = 0;
@@ -260,7 +323,125 @@ find_default_gateway_end:
 
     closesocket(sock);
     return ret;
+
+#elif defined(_WIN32)
+    // taken from (and modified)
+    // https://docs.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-createipforwardentry
+
+    PMIB_IPFORWARDTABLE pIpForwardTable = NULL;
+    DWORD dwSize = 0;
+    BOOL bOrder = FALSE;
+    DWORD dwStatus = 0;
+    unsigned int i;
+    ipstr_t gateway_address;
+
+    // find out how big our buffer needs to be
+    dwStatus = GetIpForwardTable(pIpForwardTable, &dwSize, bOrder);
+    if(dwStatus == ERROR_INSUFFICIENT_BUFFER) {
+        // allocate the memory for the table
+        if(!(pIpForwardTable = (PMIB_IPFORWARDTABLE)malloc(dwSize))) {
+            traceEvent(TRACE_DEBUG, "malloc failed, out of memory\n");
+            return EXIT_FAILURE;
+        }
+        // now get the table
+        dwStatus = GetIpForwardTable(pIpForwardTable, &dwSize, bOrder);
+    }
+
+    if (dwStatus != ERROR_SUCCESS) {
+        traceEvent(TRACE_DEBUG, "getIpForwardTable failed\n");
+        if(pIpForwardTable)
+            free(pIpForwardTable);
+        return EXIT_FAILURE;
+    }
+
+    dwStatus = EXIT_FAILURE;
+    // search for the row in the table we want. The default gateway has a destination of 0.0.0.0
+    for(i = 0; i < pIpForwardTable->dwNumEntries; i++) {
+        if(pIpForwardTable->table[i].dwForwardDest == 0) {
+            // we have found a default route
+            // do not use if the gateway is the one to be excluded
+            if(pIpForwardTable->table[i].dwForwardNextHop == exclude->S_un.S_addr)
+                continue;
+            dwStatus = 0;
+            gateway_addr->S_un.S_addr = pIpForwardTable->table[i].dwForwardNextHop;
+            traceEvent(TRACE_DEBUG, "assuming default gateway %s",
+                                    inaddrtoa(gateway_address, *gateway_addr));
+            break;
+        }
+    }
+
+    if(pIpForwardTable) {
+        free(pIpForwardTable);
+    }
+
+    return dwStatus;
+#endif
 }
+
+
+// -------------------------------------------------------------------------------------------------------
+// PLATFORM-DEPENDANT CODE
+
+
+#ifdef _WIN32
+DWORD get_interface_index (struct in_addr addr) {
+    // taken from (and modified)
+    // https://docs.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-createipforwardentry
+
+    PMIB_IPFORWARDTABLE pIpForwardTable = NULL;
+    DWORD dwSize = 0;
+    BOOL bOrder = FALSE;
+    DWORD dwStatus = 0;
+    DWORD mask_addr = 0;
+    DWORD max_idx = 0;
+    uint8_t bitlen, max_bitlen = 0;
+    unsigned int i;
+    ipstr_t gateway_address;
+
+    // find out how big our buffer needs to be
+    dwStatus = GetIpForwardTable(pIpForwardTable, &dwSize, bOrder);
+    if(dwStatus == ERROR_INSUFFICIENT_BUFFER) {
+        // allocate the memory for the table
+        if(!(pIpForwardTable = (PMIB_IPFORWARDTABLE)malloc(dwSize))) {
+            traceEvent(TRACE_DEBUG, "malloc failed, out of memory\n");
+            return EXIT_FAILURE;
+        }
+        // now get the table
+        dwStatus = GetIpForwardTable(pIpForwardTable, &dwSize, bOrder);
+    }
+
+    if (dwStatus != ERROR_SUCCESS) {
+        traceEvent(TRACE_DEBUG, "getIpForwardTable failed\n");
+        if(pIpForwardTable)
+            free(pIpForwardTable);
+        return 0;
+    }
+
+    // search for the row in the table we want. The default gateway has a destination of 0.0.0.0
+    for(i = 0; i < pIpForwardTable->dwNumEntries; i++) {
+        mask_addr = pIpForwardTable->table[i].dwForwardMask;
+        // if same subnet ...
+        if((mask_addr & addr.S_un.S_addr) == (mask_addr & pIpForwardTable->table[i].dwForwardDest)) {
+            mask_addr = ntohl(mask_addr);
+            for(bitlen = 0; (int)mask_addr < 0; mask_addr <<= 1)
+                bitlen++;
+            if(bitlen > max_bitlen) {
+                max_bitlen = bitlen;
+                max_idx = pIpForwardTable->table[i].dwForwardIfIndex;
+            }
+        }
+    }
+
+    traceEvent(TRACE_DEBUG, "found interface index %u for gateway %s",
+                           max_idx, inaddrtoa(gateway_address, addr));
+
+    if(pIpForwardTable) {
+        free(pIpForwardTable);
+    }
+
+    return max_idx;
+}
+#endif
 
 
 // -------------------------------------------------------------------------------------------------------
@@ -270,6 +451,7 @@ find_default_gateway_end:
 /* adds (verb == ROUTE_ADD) or deletes (verb == ROUTE_DEL) a route */
 void handle_route (n2n_route_t* in_route, int verb) {
 
+#if defined(__linux__)
     struct sockaddr_in *addr_tmp;
     struct rtentry route;
     SOCKET sock;
@@ -320,6 +502,33 @@ void handle_route (n2n_route_t* in_route, int verb) {
     }
 
     closesocket(sock);
+
+#elif defined(_WIN32)
+    // REVISIT: use 'CreateIpForwardEntry()' and 'DeleteIpForwardEntry()' [iphlpapi.h]
+    char c_net_addr[32];
+    char c_gateway[32];
+    char c_interface[32];
+    char c_verb[32];
+    uint32_t mask;
+    uint8_t bitlen;
+    DWORD if_idx;
+    char cmd[256];
+
+    // assemble route command components
+    _snprintf(c_net_addr, sizeof(c_net_addr), inet_ntoa(in_route->net_addr));
+    _snprintf(c_gateway, sizeof(c_gateway), inet_ntoa(in_route->gateway));
+    mask = ntohl(in_route->net_mask.S_un.S_addr);
+    for(bitlen = 0; (int)mask < 0; mask <<= 1)
+        bitlen++;
+    if_idx = get_interface_index(in_route->gateway);
+    _snprintf(c_interface, sizeof(c_interface), "if %u", if_idx);
+    _snprintf(c_verb, sizeof(c_verb), (verb == ROUTE_ADD) ? "add" : "delete");
+    _snprintf(cmd, sizeof(cmd), "route %s %s/%d %s %s > nul", c_verb, c_net_addr, bitlen, c_gateway, c_interface);
+    traceEvent(TRACE_INFO, "ROUTE CMD = '%s'\n", cmd);
+
+    // issue the route command
+    system(cmd);
+#endif
 }
 
 
@@ -363,12 +572,30 @@ int same_subnet (struct in_addr addr0, struct in_addr addr1, struct in_addr subn
 
 
 // -------------------------------------------------------------------------------------------------------
+// PLATFORM-DEPENDANT CODE
 
 
 SOCKET connect_to_management_port (n2n_route_conf_t *rrr) {
 
     SOCKET ret;
     struct sockaddr_in sock_addr;
+
+#ifdef _WIN32
+    // Windows requires a call to WSAStartup() before it can work with sockets
+    WORD wVersionRequested;
+    WSADATA wsaData;
+    int err;
+
+    // Use the MAKEWORD(lowbyte, highbyte) macro declared in Windef.h
+    wVersionRequested = MAKEWORD(2, 2);
+
+    err = WSAStartup(wVersionRequested, &wsaData);
+    if (err != 0) {
+        // tell the user that we could not find a usable Winsock DLL
+        traceEvent(TRACE_ERROR, "WSAStartup failed with error: %d\n", err);
+        return -1;
+    }
+#endif
 
     ret = socket (PF_INET, SOCK_DGRAM, 0);
     if((int)ret < 0)
@@ -420,10 +647,12 @@ int get_addr_from_json (struct in_addr *addr, json_object_t *json, char *key, in
 
 
 // -------------------------------------------------------------------------------------------------------
+// PLATFORM-DEPENDANT CODE
 
 
+#ifndef _WIN32
 // taken from https://web.archive.org/web/20170407122137/http://cc.byexamples.com/2007/04/08/non-blocking-user-input-in-loop-without-ncurses/
-int kbhit () {
+int _kbhit () {
 
     struct timeval tv;
     fd_set fds;
@@ -436,6 +665,12 @@ int kbhit () {
 
     return FD_ISSET(STDIN_FILENO, &fds);
 }
+#else
+// A dummy definition to avoid compile errors on windows
+int _kbhit () {
+    return 0;
+}
+#endif
 
 
 // -------------------------------------------------------------------------------------------------------
@@ -446,7 +681,8 @@ static void help (int level) {
     if(level == 0) return; /* no help required */
 
     printf("  n2n-route [-t <manangement_port>] [-p <management_port_password>] [-v] [-V]"
-         "\n            [-g <default gateway>] [-n <network address>/bitlen] <vpn gateway>"
+         "\n            [-g <default gateway>] [-n <network address>/bitlen[:gateway]]"
+         "\n            <vpn gateway>"
         "\n"
         "\n           This tool sets new routes for all the traffic to be routed via the"
         "\n           <vpn gateway> and polls the management port of a local n2n edge for"
@@ -454,7 +690,7 @@ static void help (int level) {
         "\n           gateway. Adapt port (default: %d) and password (default: '%s')"
         "\n           to match your edge's configuration."
       "\n\n           If no <default gateway> provided, the tool will try to auto-detect."
-      "\n\n           To not route all traffic through vpn, inidicate the networks to be"
+      "\n\n           To only route some traffic through vpn, inidicate the networks to be"
         "\n           routed with '-n' option and use as many as required."
       "\n\n           Verbosity can be increased or decreased with -v or -V , repeat as"
         "\n           as needed."
@@ -495,14 +731,18 @@ static int set_option (n2n_route_conf_t *rrr, int optkey, char *optargument) {
         }
 
         case 'n': /* user-provided network to be routed */ {
-            char cidr_net[64], bitlen;
+            char cidr_net[64], bitlen, gateway[64];
             n2n_route_t *route;
             struct in_addr mask;
+            int ret;
 
-            if(sscanf(optargument, "%63[^/]/%hhd", cidr_net, &bitlen) != 2) {
-                traceEvent(TRACE_WARNING, "bad cidr network format '%d'", optargument);
+            gateway[0] = '\0'; // optional parameter
+            ret = sscanf(optargument, "%63[^/]/%hhd:%63s", cidr_net, &bitlen, gateway);
+            if((ret < 2) || (ret > 3)) {
+                traceEvent(TRACE_WARNING, "bad cidr network format '%s'", optargument);
                 return 1;
             }
+
             if((bitlen < 0) || (bitlen > 32)) {
                 traceEvent(TRACE_WARNING, "bad prefix '%d' in '%s'", bitlen, optargument);
                 return 1;
@@ -511,14 +751,19 @@ static int set_option (n2n_route_conf_t *rrr, int optkey, char *optargument) {
                 traceEvent(TRACE_WARNING, "bad network '%s' in '%s'", cidr_net, optargument);
                 return 1;
             }
-
-            traceEvent(TRACE_NORMAL, "routing %s/%d", cidr_net, bitlen);
+            if(gateway[0]) {
+                if(!inet_address_valid(inet_address(gateway))) {
+                    traceEvent(TRACE_WARNING, "bad gateway '%s' in '%s'", gateway, optargument);
+                    return 1;
+                 }
+            }
+            traceEvent(TRACE_NORMAL, "routing %s/%d via %s", cidr_net, bitlen, gateway[0] ? gateway : "vpn gateway");
 
             route = calloc(1, sizeof(*route));
             if(route) {
                 mask.s_addr = htonl(bitlen2mask(bitlen));
-                // gateway is unknown at this point, will be rectified later
-                fill_route(route, inet_address(cidr_net), mask, inet_address(""));
+                // gateway might be unknown at this point, will be rectified later
+                fill_route(route, inet_address(cidr_net), mask, inet_address(gateway));
                 HASH_ADD(hh, rrr->routes, net_addr, sizeof(route->net_addr), route);
                 // will be added to system table later
             }
@@ -617,12 +862,16 @@ int main (int argc, char* argv[]) {
             fill_route(route, inet_address(UPPER_HALF), inet_address(MASK_HALF), rrr.gateway_vpn);
             HASH_ADD(hh, rrr.routes, net_addr, sizeof(route->net_addr), route);
         }
+    } else {
+        traceEvent(TRACE_WARNING, "only user-supplied networks will be routed, not the complete traffic");
     }
-    // set gateway for all so far present routes as '-n'-provided do not have it yet,
+    // set gateway for all so far present routes if '-n'-provided do not have it yet,
     // make them UNPURGEABLE and add them to system table
     HASH_ITER(hh, rrr.routes, route, tmp_route) {
-        route->gateway = rrr.gateway_vpn;
-        route->purgeable = UNPURGEABLE;
+        if(!inet_address_valid(route->gateway)) {
+            route->gateway = rrr.gateway_vpn;
+        }
+        route->purgeable = false;
         handle_route(route, ROUTE_ADD);
     }
 
@@ -658,7 +907,7 @@ reset_main_loop:
     // read answer packet by packet which are only accepted if a corresponding request was sent before
     // of which we know about by having set the related tag, tag_info or tag_route_ip resp.
     // a valid edge ip address indicates that we have seen a valid answer to the info request
-    while(keep_running && !kbhit()) {
+    while(keep_running && !_kbhit()) {
         // current time
         now = time(NULL);
 
@@ -671,7 +920,7 @@ reset_main_loop:
                 rrr.gateway_org = addr_tmp;
                 // delete all purgeable routes as they are still relying on old original default gateway
                 HASH_ITER(hh, rrr.routes, route, tmp_route) {
-                    if((route->purgeable == PURGEABLE)) {
+                    if((route->purgeable == true)) {
                         handle_route(route, ROUTE_DEL);
                         HASH_DEL(rrr.routes, route);
                         free(route);
@@ -732,7 +981,7 @@ reset_main_loop:
         if(now > last_purge + PURGE_INTERVAL) {
             last_purge = now;
             HASH_ITER(hh, rrr.routes, route, tmp_route) {
-                if((route->purgeable == PURGEABLE) && (now > route->last_seen + REMOVE_ROUTE_AGE)) {
+                if((route->purgeable == true) && (now > route->last_seen + REMOVE_ROUTE_AGE)) {
                     handle_route(route, ROUTE_DEL);
                     HASH_DEL(rrr.routes, route);
                     free(route);
@@ -802,7 +1051,7 @@ reset_main_loop:
                                HASH_DEL(rrr.routes, route);
                             if(route) {
                                 fill_route(route, addr, inet_address(HOST_MASK), rrr.gateway_org);
-                                route->purgeable = PURGEABLE;
+                                route->purgeable = true;
                                 if(!(route->last_seen)) {
                                     handle_route(route, ROUTE_ADD);
                                 }
@@ -846,16 +1095,16 @@ end_route_tool:
 }
 
 
-#else  /* ifdef __linux__  --  currently, Linux only */
+#else  /* if defined(__linux__) || defined(_WIN64) --  currently, Linux and Windows only */
 
 
 int main (int argc, char* argv[]) {
 
-    traceEvent(TRACE_WARNING, "currently, only Linux is supported");
+    traceEvent(TRACE_WARNING, "currently, only Linux and 64-bit Windows are supported");
     traceEvent(TRACE_WARNING, "if you want to port to other OS, please find the source code having clearly marked the platform-dependant portions");
 
     return 0;
 }
 
 
-#endif /* ifdef __linux__  --  currently, Linux only */
+#endif /* if defined (__linux__) || defined(_WIN64)  --  currently, Linux and Windows only */

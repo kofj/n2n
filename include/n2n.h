@@ -35,137 +35,65 @@
 
 #define N2N_HAVE_DAEMON /* needs to be defined before it gets undefined */
 #define N2N_HAVE_TCP    /* needs to be defined before it gets undefined */
+#define HAVE_BRIDGING_SUPPORT
 
 /* #define N2N_CAN_NAME_IFACE */
 
-/* Moved here to define _CRT_SECURE_NO_WARNINGS before all the including takes place */
-#ifdef WIN32
-#ifndef CMAKE_BUILD
 #include "config.h" /* Visual C++ */
-#else
-#include "winconfig.h"
-#endif
+
+/* Moved here to define _CRT_SECURE_NO_WARNINGS before all the including takes place */
+#ifdef _WIN32
 #define N2N_CAN_NAME_IFACE 1
 #undef N2N_HAVE_DAEMON
 #undef N2N_HAVE_TCP           /* as explained on https://github.com/ntop/n2n/pull/627#issuecomment-782093706 */
 #undef N2N_HAVE_SETUID
-#else
-#ifndef CMAKE_BUILD
-#include "config.h"
-#endif
-#endif
+#endif /* _WIN32 */
 
 
+#include <stdbool.h>
+#include <stdio.h>         // for size_t, FILE
+#include "n2n_define.h"
+#include "n2n_typedefs.h"
 
-#define PACKAGE_BUILDDATE (__DATE__ " " __TIME__)
+#ifdef _WIN32
+#include <winsock2.h>           /* for tcp */
+#include <lmaccess.h>           /* for privilege check in tools/n2n-route */
+#include <lmapibuf.h>           /* for privilege check in tools/n2n-route */
+#include <sys/stat.h>
+#include <windows.h>            /* for privilege check in tools/n2n-route */
+#define SHUT_RDWR   SD_BOTH     /* for tcp */
+#endif /* #ifdef _WIN32 */
 
-#include <time.h>
-#include <ctype.h>
-#include <stdlib.h>
-
-#ifndef WIN32
-#include <netdb.h>
-#endif
-
-#ifndef _MSC_VER
-#include <getopt.h>
-#endif /* #ifndef _MSC_VER */
-
-#include <stdio.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdint.h>
-#include <time.h>
-
-#ifndef WIN32
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/param.h>
-#include <pthread.h>
+#ifndef _WIN32
+#include <netinet/in.h>    // for in_addr (ptr only), in_addr_t
+#include <pwd.h>
+#include <stdint.h>        // for uint8_t, uint64_t, uint32_t, uint16_t
+#include <sys/types.h>     // for time_t
+#include <unistd.h>        // for close
+#define closesocket(a) close(a)
 
 #ifdef __linux__
 #define N2N_CAN_NAME_IFACE 1
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
-#include <unistd.h>
-#include <net/if_arp.h>
-#include <net/if.h>
-#include <linux/if_tun.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
 #endif /* #ifdef __linux__ */
 
 #ifdef __FreeBSD__
 #include <netinet/in_systm.h>
 #endif /* #ifdef __FreeBSD__ */
 
-#include <syslog.h>
-#include <sys/wait.h>
-
 #ifdef HAVE_ZSTD
 #include <zstd.h>
 #endif
 
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/udp.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <unistd.h>
-#include <string.h>
-#include <assert.h>
-#include <sys/stat.h>
-#include <stdint.h>
-#if defined (HAVE_OPENSSL_1_1)
+#ifdef HAVE_LIBCRYPTO
 #include <openssl/opensslv.h>
 #include <openssl/crypto.h>
 #endif
+#endif /* #ifndef _WIN32 */
 
-#define closesocket(a) close(a)
-#endif /* #ifndef WIN32 */
 
-#include "minilzo.h"
-#include <signal.h>
-#include <string.h>
-#include <stdarg.h>
-#include "lzoconf.h"
-#include "uthash.h"
-#include "n2n_define.h"
-#include "n2n_typedefs.h"
 
-#ifdef WIN32
-#include <winsock2.h>           /* for tcp */
-#define SHUT_RDWR   SD_BOTH     /* for tcp */
-#include "wintap.h"
-#include <sys/stat.h>
-#else
-#include <pwd.h>
-#endif /* #ifdef WIN32 */
-
-#include "n2n_wire.h"
-#include "random_numbers.h"
-#include "pearson.h"
-#include "portable_endian.h"
-#include "aes.h"
-#include "cc20.h"
-#include "speck.h"
-#include "curve25519.h"
-#include "n2n_regex.h"
-#include "sn_selection.h"
-#include "network_traffic_filter.h"
-#include "auth.h"
-
-#include "n2n_port_mapping.h"
-
-#include "json.h"
 
 /* ************************************** */
-
-#include "header_encryption.h"
-#include "tf.h"
 
 #ifndef TRACE_ERROR
 #define TRACE_ERROR       0
@@ -199,11 +127,7 @@ void _traceEvent (int eventTraceLevel, char* file, int line, char * format, ...)
 
 /* Tuntap API */
 int tuntap_open (struct tuntap_dev *device, char *dev, const char *address_mode, char *device_ip,
-                 char *device_mask, const char * device_mac, int mtu
-#ifdef WIN32
-				, int metric
-#endif
-                 );
+                 char *device_mask, const char * device_mac, int mtu, int metric);
 int tuntap_read (struct tuntap_dev *tuntap, unsigned char *buf, int len);
 int tuntap_write (struct tuntap_dev *tuntap, unsigned char *buf, int len);
 void tuntap_close (struct tuntap_dev *tuntap);
@@ -279,7 +203,7 @@ int quick_edge_init (char *device_name, char *community_name,
                      char *encrypt_key, char *device_mac,
                      char *local_ip_address,
                      char *supernode_ip_address_port,
-                     int *keep_on_running);
+                     bool *keep_on_running);
 int comm_init (struct sn_community *comm, char *cmn);
 int sn_init_defaults (n2n_sn_t *sss);
 void sn_init (n2n_sn_t *sss);

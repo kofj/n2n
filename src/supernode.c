@@ -18,8 +18,31 @@
 
 /* Supernode for n2n-2.x */
 
-#include "n2n.h"
-#include "header_encryption.h"
+
+#include <ctype.h>             // for isspace
+#include <errno.h>             // for errno
+#include <getopt.h>            // for required_argument, getopt_long, no_arg...
+#include <signal.h>            // for signal, SIGHUP, SIGINT, SIGPIPE, SIGTERM
+#include <stdbool.h>
+#include <stdint.h>            // for uint8_t, uint32_t
+#include <stdio.h>             // for printf, NULL, fclose, fgets, fopen
+#include <stdlib.h>            // for exit, atoi, calloc, free
+#include <string.h>            // for strerror, strlen, memcpy, strncpy, str...
+#include <sys/types.h>         // for time_t, u_char, u_int
+#include <time.h>              // for time
+#include <unistd.h>            // for _exit, daemon, getgid, getuid, setgid
+#include "n2n.h"               // for n2n_sn_t, sn_community, traceEvent
+#include "pearson.h"           // for pearson_hash_64
+#include "uthash.h"            // for UT_hash_handle, HASH_ITER, HASH_ADD_STR
+
+#ifdef _WIN32
+#include "win32/defs.h"
+#else
+#include <arpa/inet.h>         // for inet_addr
+#include <netinet/in.h>        // for ntohl, INADDR_ANY, INADDR_NONE, in_addr_t
+#include <pwd.h>               // for getpwnam, passwd
+#include <sys/socket.h>        // for listen, AF_INET
+#endif
 
 #define HASH_FIND_COMMUNITY(head, name, out) HASH_FIND_STR(head, name, out)
 
@@ -52,7 +75,7 @@ static void help (int level) {
                "\n short help text is displayed"
              "\n\n  -h    shows a quick reference including all available options"
                "\n --help gives a detailed parameter description"
-               "\n   man  files for n2n, edge, and superndode contain in-depth information"
+               "\n   man  files for n2n, edge, and supernode contain in-depth information"
                "\n\n");
 
     } else if(level == 2) /* quick reference */ {
@@ -83,7 +106,7 @@ static void help (int level) {
             "\n                           "
                "[--management-password <pw>] "
                "[-v] "
-#ifndef WIN32
+#ifndef _WIN32
             "\n                           "
                "[-u <numerical user id>]"
                "[-g <numerical group id>]"
@@ -102,7 +125,7 @@ static void help (int level) {
           "\n short help text is displayed"
         "\n\n  -h    shows this quick reference including all available options"
           "\n --help gives a detailed parameter description"
-          "\n   man  files for n2n, edge, and superndode contain in-depth information"
+          "\n   man  files for n2n, edge, and supernode contain in-depth information"
           "\n\n");
 
     } else /* long help */ {
@@ -144,7 +167,7 @@ static void help (int level) {
         printf(" --management_...  | management port password, defaults to '%s'\n"
                " ...password <pw>  | \n", N2N_MGMT_PASSWORD);
         printf(" -v                | make more verbose, repeat as required\n");
-#ifndef WIN32
+#ifndef _WIN32
         printf(" -u <UID>          | numeric user ID to use when privileges are dropped\n");
         printf(" -g <GID>          | numeric group ID to use when privileges are dropped\n");
 #endif
@@ -153,7 +176,7 @@ static void help (int level) {
                "\n short help text is displayed"
              "\n\n  -h    shows a quick reference including all available options"
                "\n --help gives this detailed parameter description"
-               "\n   man  files for n2n, edge, and superndode contain in-depth information"
+               "\n   man  files for n2n, edge, and supernode contain in-depth information"
                "\n\n");
     }
 
@@ -249,7 +272,7 @@ static int setOption (int optkey, char *_optarg, n2n_sn_t *sss) {
                         strncpy(anchor_sn->ip_addr, _optarg, N2N_EDGE_SN_HOST_SIZE - 1);
 	                memcpy(&(anchor_sn->sock), socket, sizeof(n2n_sock_t));
                         memcpy(anchor_sn->mac_addr, null_mac, sizeof(n2n_mac_t));
-                        anchor_sn->purgeable = UNPURGEABLE;
+                        anchor_sn->purgeable = false;
                         anchor_sn->last_valid_time_stamp = initial_time_stamp();
                     }
                 }
@@ -300,7 +323,7 @@ static int setOption (int optkey, char *_optarg, n2n_sn_t *sss) {
 
             break;
         }
-#ifndef WIN32
+#ifndef _WIN32
         case 'u': /* unprivileged uid */
             sss->userid = atoi(_optarg);
             break;
@@ -312,7 +335,7 @@ static int setOption (int optkey, char *_optarg, n2n_sn_t *sss) {
         case 'F': { /* federation name */
             snprintf(sss->federation->community, N2N_COMMUNITY_SIZE - 1 ,"*%s", _optarg);
             sss->federation->community[N2N_COMMUNITY_SIZE - 1] = '\0';
-            sss->federation->purgeable = UNPURGEABLE;
+            sss->federation->purgeable = false;
             break;
         }
 #ifdef SN_MANUAL_MAC
@@ -401,7 +424,7 @@ static int loadFromCLI (int argc, char * const argv[], n2n_sn_t *sss) {
 #if defined(N2N_HAVE_DAEMON)
                            "f"
 #endif
-#ifndef WIN32
+#ifndef _WIN32
                            "u:g:"
 #endif
                             ,
@@ -541,10 +564,10 @@ static void dump_registrations (int signo) {
 
 /* *************************************************** */
 
-static int keep_running;
+static bool keep_running = true;
 
-#if defined(__linux__) || defined(WIN32)
-#ifdef WIN32
+#if defined(__linux__) || defined(_WIN32)
+#ifdef _WIN32
 BOOL WINAPI term_handler (DWORD sig)
 #else
     static void term_handler(int sig)
@@ -560,12 +583,12 @@ BOOL WINAPI term_handler (DWORD sig)
         called = 1;
     }
 
-    keep_running = 0;
-#ifdef WIN32
+    keep_running = false;
+#ifdef _WIN32
     return(TRUE);
 #endif
 }
-#endif /* defined(__linux__) || defined(WIN32) */
+#endif /* defined(__linux__) || defined(_WIN32) */
 
 /* *************************************************** */
 
@@ -573,7 +596,7 @@ BOOL WINAPI term_handler (DWORD sig)
 int main (int argc, char * const argv[]) {
 
     int rc;
-#ifndef WIN32
+#ifndef _WIN32
     struct passwd *pw = NULL;
 #endif
     struct peer_info *scan, *tmp;
@@ -591,7 +614,7 @@ int main (int argc, char * const argv[]) {
         rc = loadFromCLI(argc, argv, &sss_node);
     } else
 
-#ifdef WIN32
+#ifdef _WIN32
         // load from current directory
         rc = loadFromFile("supernode.conf", &sss_node);
 #else
@@ -665,7 +688,7 @@ int main (int argc, char * const argv[]) {
     HASH_ITER(hh, sss_node.federation->edges, scan, tmp)
         scan->socket_fd = sss_node.sock;
 
-#ifndef WIN32
+#ifndef _WIN32
     /*
      * If no uid/gid is specified on the commandline, use the uid/gid of the
      * first found out of user "n2n" or "nobody"
@@ -710,11 +733,10 @@ int main (int argc, char * const argv[]) {
     signal(SIGINT,  term_handler);
     signal(SIGHUP,  dump_registrations);
 #endif
-#ifdef WIN32
+#ifdef _WIN32
     SetConsoleCtrlHandler(term_handler, TRUE);
 #endif
 
-    keep_running = 1;
     sss_node.keep_running = &keep_running;
     return run_sn_loop(&sss_node);
 }

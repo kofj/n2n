@@ -51,7 +51,9 @@
 #define REGISTER_SUPER_INTERVAL_DFL      20 /* sec, usually UDP NAT entries in a firewall expire after 30 seconds */
 #define SWEEP_TIME                       30 /* sec, indicates the value after which we have to sort the hash list of supernodes in edges
                                              * and when we send out packets to query selection-relevant informations from supernodes. */
-
+#ifdef HAVE_BRIDGING_SUPPORT
+#define HOSTINFO_TIMEOUT                300 /* sec, how long after last seen will the hostinfo be deleted */
+#endif
 #define NUMBER_SN_PINGS_INITIAL          15 /* number of supernodes to concurrently ping during bootstrap and immediately afterwards */
 #define NUMBER_SN_PINGS_REGULAR           5 /* number of supernodes to concurrently ping during regular edge operation */
 
@@ -96,9 +98,6 @@
 /* Federation name and indicators */
 #define FEDERATION_NAME "*Federation"
 enum federation {IS_NO_FEDERATION = 0,IS_FEDERATION = 1};
-
-/* (un)purgeable indicator for supernodes, communities, routes, ... */
-enum sn_purge {UNPURGEABLE = 0, PURGEABLE = 1};
 
 /* Header encryption indicators */
 #define HEADER_ENCRYPTION_UNKNOWN             0
@@ -191,7 +190,7 @@ enum skip_add {SN_ADD = 0, SN_ADD_SKIP = 1, SN_ADD_ADDED = 2};
 #define N2N_MULTICAST_PORT         1968
 #define N2N_MULTICAST_GROUP        "224.0.0.68"
 
-#ifdef WIN32
+#ifdef _WIN32
 #define N2N_IFNAMSIZ               64
 #else
 #define N2N_IFNAMSIZ               16 /* 15 chars * NULL */

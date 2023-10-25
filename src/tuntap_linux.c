@@ -20,7 +20,23 @@
 #ifdef __linux__
 
 
-#include "n2n.h"
+#include <arpa/inet.h>                // for inet_addr, inet_pton
+#include <sys/uio.h>                  // for iovec
+#include <errno.h>                    // for errno
+#include <fcntl.h>                    // for open, O_RDWR
+#include <linux/if_tun.h>             // for IFF_NO_PI, IFF_TAP, TUNSETIFF
+#include <linux/netlink.h>            // for sockaddr_nl, nlmsghdr, NETLINK_...
+#include <linux/rtnetlink.h>          // for ifinfomsg, RTMGRP_LINK
+#include <net/if.h>                   // for ifreq, IFNAMSIZ, ifr_name, ifr_...
+#include <net/if_arp.h>               // for ARPHRD_ETHER
+#include <netinet/in.h>               // for sockaddr_in, IPPROTO_IP, in_addr
+#include <stdint.h>                   // for uint8_t
+#include <string.h>                   // for strerror, memset, strncpy, memcpy
+#include <sys/ioctl.h>                // for ioctl, SIOCGIFADDR, SIOCGIFFLAGS
+#include <sys/param.h>                // for MIN
+#include <sys/socket.h>               // for socket, msghdr, AF_INET, sockaddr
+#include <unistd.h>                   // for close, getpid, read, write, ssi...
+#include "n2n.h"                      // for tuntap_dev, traceEvent, TRACE_E...
 
 
 static int setup_ifname (int fd, const char *ifname, const char *ipaddr,
@@ -104,7 +120,8 @@ int tuntap_open (tuntap_dev *device,
                  char *device_ip,
                  char *device_mask,
                  const char * device_mac,
-                 int mtu) {
+                 int mtu,
+                 int ignored) {
 
     char *tuntap_device = "/dev/net/tun";
     int ioctl_fd;

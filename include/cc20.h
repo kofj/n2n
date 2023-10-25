@@ -21,16 +21,16 @@
 #define CC20_H
 
 
-#include <stdint.h>
-
-#include "n2n.h"               // HAVE_OPENSSL_1_1, traceEvent ...
+#include <stddef.h>  // for size_t
+#include <stdint.h>  // for uint32_t, uint8_t
+#include "config.h"  // HAVE_LIBCRYPTO
 
 
 #define CC20_IV_SIZE           16
 #define CC20_KEY_BYTES       (256/8)
 
 
-#ifdef HAVE_OPENSSL_1_1 // openSSL 1.1 ----------------------------------------------------------------------------
+#ifdef HAVE_LIBCRYPTO // openSSL 1.1 ----------------------------------------------------------------------------
 
 
 #include <openssl/evp.h>
@@ -45,8 +45,6 @@ typedef struct cc20_context_t {
 
 #elif defined (__SSE2__)  // SSE2 ---------------------------------------------------------------------------------
 
-
-#include <immintrin.h>
 
 typedef struct cc20_context {
     uint32_t keystream32[16];

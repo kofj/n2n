@@ -16,9 +16,40 @@
  *
  */
 
-#include "n2n.h"
-#include "network_traffic_filter.h"
-#include "edge_utils_win32.h"
+
+#include <errno.h>                   // for errno, EAFNOSUPPORT, EINPROGRESS
+#include <fcntl.h>                   // for fcntl, F_SETFL, O_NONBLOCK
+#include <stdbool.h>
+#include <stdint.h>                  // for uint8_t, uint16_t, uint32_t, uin...
+#include <stdio.h>                   // for snprintf, sprintf
+#include <stdlib.h>                  // for free, calloc, getenv
+#include <string.h>                  // for memcpy, memset, NULL, memcmp
+#include <sys/time.h>                // for timeval
+#include <sys/types.h>               // for time_t, ssize_t, u_int
+#include <time.h>                    // for time
+#include <unistd.h>                  // for gethostname, sleep
+#include "auth.h"                    // for generate_private_key
+#include "portable_endian.h"         // for be16toh, htobe16
+#include "header_encryption.h"       // for packet_header_encrypt, packet_he...
+#include "n2n.h"                     // for n2n_edge_t, peer_info, n2n_edge_...
+#include "n2n_wire.h"                // for encode_mac, fill_sockaddr, decod...
+#include "network_traffic_filter.h"  // for create_network_traffic_filter
+#include "pearson.h"                 // for pearson_hash_128, pearson_hash_64
+#include "random_numbers.h"          // for n2n_rand, n2n_rand_sqr
+#include "sn_selection.h"            // for sn_selection_criterion_common_da...
+#include "speck.h"                   // for speck_128_decrypt, speck_128_enc...
+#include "uthash.h"                  // for UT_hash_handle, HASH_COUNT, HASH...
+
+#ifdef _WIN32
+#include "win32/defs.h"
+#include "win32/edge_utils_win32.h"
+#else
+#include <arpa/inet.h>               // for inet_ntoa, inet_addr, inet_ntop
+#include <netinet/in.h>              // for sockaddr_in, ntohl, IPPROTO_IP
+#include <netinet/tcp.h>             // for TCP_NODELAY
+#include <sys/select.h>              // for select, FD_SET, FD_ISSET, FD_ZERO
+#include <sys/socket.h>              // for setsockopt, AF_INET, connect
+#endif
 
 
 /* ************************************** */
@@ -275,7 +306,7 @@ int supernode_connect (n2n_edge_t *eee) {
         // set tcp socket to O_NONBLOCK so connect does not hang
         // requires checking the socket for readiness before sending and receving
         if(eee->conf.connect_tcp) {
-#ifdef WIN32
+#ifdef _WIN32
             u_long value = 1;
             ioctlsocket(eee->sock, FIONBIO, &value);
 #else
@@ -652,6 +683,7 @@ static void register_with_new_peer (n2n_edge_t *eee,
         scan->sock = *peer;
         scan->timeout = eee->conf.register_interval; /* TODO: should correspond to the peer supernode registration timeout */
         scan->last_valid_time_stamp = initial_time_stamp();
+        scan->purgeable = true;
         if(via_multicast)
             scan->local = 1;
 
@@ -673,7 +705,7 @@ static void register_with_new_peer (n2n_edge_t *eee,
              */
             if(eee->conf.register_ttl == 1) {
                 /* We are DMZ host or port is directly accessible. Just let peer to send back the ack */
-#ifndef WIN32
+#ifndef _WIN32
             } else if(eee->conf.register_ttl > 1) {
                 /* Setting register_ttl usually implies that the edge knows the internal net topology
                  * clearly, we can apply aggressive port prediction to support incoming Symmetric NAT
@@ -1054,7 +1086,7 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
     traceEvent(level, "sendto(%s) failed (%d) %s",
             sock_to_cstr(sockbuf, n2ndest),
             errno, errstr);
-#ifdef WIN32
+#ifdef _WIN32
     traceEvent(level, "WSAGetLastError(): %u", WSAGetLastError());
 #endif
 
@@ -1063,15 +1095,25 @@ static ssize_t sendto_fd (n2n_edge_t *eee, const void *buf,
      * if the sendto had an error
      */
 err_out:
-    supernode_disconnect(eee);
-    eee->sn_wait = 1;
-    traceEvent(TRACE_DEBUG, "error in sendto_fd");
+    if(eee->conf.connect_tcp) {
+        supernode_disconnect(eee);
+        eee->sn_wait = 1;
+        traceEvent(TRACE_DEBUG, "error in sendto_fd");
+    }
+
+    /*
+     * If we got an error and are using UDP, this is still an error
+     * case.  The only caller of sendto_fd() checks the return only
+     * in the TCP case.
+     *
+     * Thus, we can safely return an error code for any error.
+     */
     return -1;
 }
 
 
 /** Send a datagram to a socket defined by a n2n_sock_t */
-static ssize_t sendto_sock (n2n_edge_t *eee, const void * buf,
+static void sendto_sock (n2n_edge_t *eee, const void * buf,
                             size_t len, const n2n_sock_t * dest) {
 
     struct sockaddr_in peer_addr;
@@ -1081,16 +1123,16 @@ static ssize_t sendto_sock (n2n_edge_t *eee, const void * buf,
     // TODO: audit callers and confirm if this can ever happen
     if(!eee) {
         traceEvent(TRACE_WARNING, "bad eee");
-        return -1;
+        return;
     }
 
     if(!dest->family)
         // invalid socket
-        return 0;
+        return;
 
     if(eee->sock < 0)
         // invalid socket file descriptor, e.g. TCP unconnected has fd of '-1'
-        return 0;
+        return;
 
     // network order socket
     fill_sockaddr((struct sockaddr *) &peer_addr, sizeof(peer_addr), dest);
@@ -1098,7 +1140,7 @@ static ssize_t sendto_sock (n2n_edge_t *eee, const void * buf,
     // if the connection is tcp, i.e. not the regular sock...
     if(eee->conf.connect_tcp) {
 
-        setsockopt(eee->sock, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+        setsockopt(eee->sock, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
         value = 1;
 #ifdef LINUX
         setsockopt(eee->sock, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
@@ -1109,7 +1151,7 @@ static ssize_t sendto_sock (n2n_edge_t *eee, const void * buf,
         sent = sendto_fd(eee, (uint8_t*)&pktsize16, sizeof(pktsize16), &peer_addr, dest);
 
         if(sent <= 0)
-            return -1;
+            return;
         // ...before sending the actual data
     }
     sent = sendto_fd(eee, buf, len, &peer_addr, dest);
@@ -1117,14 +1159,14 @@ static ssize_t sendto_sock (n2n_edge_t *eee, const void * buf,
     // if the connection is tcp, i.e. not the regular sock...
     if(eee->conf.connect_tcp) {
         value = 1; /* value should still be set to 1 */
-        setsockopt(eee->sock, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+        setsockopt(eee->sock, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
 #ifdef LINUX
         value = 0;
         setsockopt(eee->sock, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
 #endif
     }
 
-    return sent;
+    return;
 }
 
 
@@ -1140,9 +1182,9 @@ static void check_join_multicast_group (n2n_edge_t *eee) {
         if(!eee->multicast_joined) {
             struct ip_mreq mreq;
             mreq.imr_multiaddr.s_addr = inet_addr(N2N_MULTICAST_GROUP);
-#ifdef WIN32
+#ifdef _WIN32
             dec_ip_str_t ip_addr;
-            get_best_interface_ip(eee, ip_addr);
+            get_best_interface_ip(eee, &ip_addr);
             mreq.imr_interface.s_addr = inet_addr(ip_addr);
 #else
             mreq.imr_interface.s_addr = htonl(INADDR_ANY);
@@ -1152,7 +1194,7 @@ static void check_join_multicast_group (n2n_edge_t *eee) {
                 traceEvent(TRACE_WARNING, "failed to bind to local multicast group %s:%u [errno %u]",
                            N2N_MULTICAST_GROUP, N2N_MULTICAST_PORT, errno);
 
-#ifdef WIN32
+#ifdef _WIN32
                 traceEvent(TRACE_WARNING, "WSAGetLastError(): %u", WSAGetLastError());
 #endif
             } else {
@@ -1301,7 +1343,7 @@ void send_register_super (n2n_edge_t *eee) {
         }
     }
 
-    /* sent = */ sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock));
+    sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock));
 }
 
 
@@ -1337,7 +1379,7 @@ static void send_unregister_super (n2n_edge_t *eee) {
                               eee->conf.header_encryption_ctx_dynamic, eee->conf.header_iv_ctx_dynamic,
                               time_stamp());
 
-    /* sent = */ sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock));
+    sendto_sock(eee, pktbuf, idx, &(eee->curr_sn->sock));
 
 }
 
@@ -1438,7 +1480,7 @@ static void send_register (n2n_edge_t * eee,
                               eee->conf.header_encryption_ctx_dynamic, eee->conf.header_iv_ctx_dynamic,
                               time_stamp());
 
-    /* sent = */ sendto_sock(eee, pktbuf, idx, remote_peer);
+    sendto_sock(eee, pktbuf, idx, remote_peer);
 }
 
 /* ************************************** */
@@ -1483,7 +1525,7 @@ static void send_register_ack (n2n_edge_t * eee,
                               eee->conf.header_encryption_ctx_dynamic, eee->conf.header_iv_ctx_dynamic,
                               time_stamp());
 
-    /* sent = */ sendto_sock(eee, pktbuf, idx, remote_peer);
+    sendto_sock(eee, pktbuf, idx, remote_peer);
 }
 
 /* ************************************** */
@@ -1600,14 +1642,14 @@ void update_supernode_reg (n2n_edge_t * eee, time_t now) {
         --(eee->sup_attempts);
     }
 
-#ifndef HAVE_PTHREAD
+#ifndef HAVE_LIBPTHREAD
     if(supernode2sock(&(eee->curr_sn->sock), eee->curr_sn->ip_addr) == 0) {
 #endif
         traceEvent(TRACE_INFO, "registering with supernode [%s][number of supernodes %d][attempts left %u]",
                    supernode_ip(eee), HASH_COUNT(eee->conf.supernodes), (unsigned int)eee->sup_attempts);
 
         send_register_super(eee);
-#ifndef HAVE_PTHREAD
+#ifndef HAVE_LIBPTHREAD
     }
 #endif
 
@@ -1753,6 +1795,24 @@ static int handle_PACKET (n2n_edge_t * eee,
                 }
             }
 
+#ifdef HAVE_BRIDGING_SUPPORT
+            if((eee->conf.allow_routing) && (!is_multi_broadcast(eh->shost))) {
+                struct host_info *host = NULL;
+
+                HASH_FIND(hh, eee->known_hosts, eh->shost, sizeof(n2n_mac_t), host);
+                if(host == NULL) {
+                    struct host_info *host = calloc(1, sizeof(struct host_info));
+                    memcpy(host->mac_addr, eh->shost, sizeof(n2n_mac_t));
+                    memcpy(host->edge_addr, pkt->srcMac, sizeof(n2n_mac_t));
+                    host->last_seen = now;
+                    HASH_ADD(hh, eee->known_hosts, mac_addr, sizeof(n2n_mac_t), host);
+                } else {
+                    memcpy(host->edge_addr, pkt->srcMac, sizeof(n2n_mac_t));
+                    host->last_seen = now;
+                }
+            }
+#endif
+
             if(eee->network_traffic_filter->filter_packet_from_peer(eee->network_traffic_filter, eee, orig_sender,
                                                                     eth_payload, eth_size) == N2N_DROP) {
                 traceEvent(TRACE_DEBUG, "filtered packet of size %u", (unsigned int)eth_size);
@@ -1791,7 +1851,7 @@ static int handle_PACKET (n2n_edge_t * eee,
 
 
 #if 0
-#ifndef WIN32
+#ifndef _WIN32
 
 static char *get_ip_from_arp (dec_ip_str_t buf, const n2n_mac_t req_mac) {
 
@@ -1844,6 +1904,7 @@ static int check_query_peer_info (n2n_edge_t *eee, time_t now, n2n_mac_t mac) {
         scan->timeout = eee->conf.register_interval; /* TODO: should correspond to the peer supernode registration timeout */
         scan->last_seen = now; /* Don't change this it marks the pending peer for removal. */
         scan->last_valid_time_stamp = initial_time_stamp();
+        scan->purgeable = true;
 
         HASH_ADD_PEER(eee->pending_peers, scan);
     }
@@ -1948,13 +2009,13 @@ static int send_packet (n2n_edge_t * eee,
         // if no supernode around, foward the broadcast to all known peers
         if(eee->sn_wait) {
             HASH_ITER(hh, eee->known_peers, peer, tmp_peer)
-                /* s = */ sendto_sock(eee, pktbuf, pktlen, &peer->sock);
+                sendto_sock(eee, pktbuf, pktlen, &peer->sock);
             return 0;
         }
         // fall through otherwise
     }
 
-    /* s = */ sendto_sock(eee, pktbuf, pktlen, &destination);
+    sendto_sock(eee, pktbuf, pktlen, &destination);
 
     return 0;
 }
@@ -2004,6 +2065,16 @@ void edge_send_packet2net (n2n_edge_t * eee,
     /* Once processed, send to destination in PACKET */
 
     memcpy(destMac, tap_pkt, N2N_MAC_SIZE); /* dest MAC is first in ethernet header */
+#ifdef HAVE_BRIDGING_SUPPORT
+    /* find the destMac behind which edge, and change dest to this edge */
+    if((eee->conf.allow_routing) && (!is_multi_broadcast(destMac))) {
+        struct host_info *host = NULL;
+        HASH_FIND(hh, eee->known_hosts, destMac, sizeof(n2n_mac_t), host);
+        if(host) {
+            memcpy(destMac, host->edge_addr, N2N_MAC_SIZE);
+        }
+    }
+#endif
 
     memset(&cmn, 0, sizeof(cmn));
     cmn.ttl = N2N_DEFAULT_TTL;
@@ -2112,10 +2183,8 @@ void edge_read_from_tap (n2n_edge_t * eee) {
         sleep(3);
         tuntap_close(&(eee->device));
         tuntap_open(&(eee->device), eee->tuntap_priv_conf.tuntap_dev_name, eee->tuntap_priv_conf.ip_mode, eee->tuntap_priv_conf.ip_addr,
-                    eee->tuntap_priv_conf.netmask, eee->tuntap_priv_conf.device_mac, eee->tuntap_priv_conf.mtu
-#ifdef WIN32
-				   ,eee->tuntap_priv_conf.metric
-#endif
+                    eee->tuntap_priv_conf.netmask, eee->tuntap_priv_conf.device_mac, eee->tuntap_priv_conf.mtu,
+                    eee->tuntap_priv_conf.metric
                     );
     } else {
         const uint8_t * mac = eth_pkt;
@@ -2721,18 +2790,18 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
 #endif
       ) {
         // udp
-        bread = recvfrom(sock, pktbuf, N2N_PKT_BUF_SIZE, 0 /*flags*/,
+        bread = recvfrom(sock, (void *)pktbuf, N2N_PKT_BUF_SIZE, 0 /*flags*/,
                          sender_sock, &ss_size);
 
         if((bread < 0)
-#ifdef WIN32
+#ifdef _WIN32
            && (WSAGetLastError() != WSAECONNRESET)
 #endif
           ) {
             /* For UDP bread of zero just means no data (unlike TCP). */
             /* The fd is no good now. Maybe we lost our interface. */
             traceEvent(TRACE_ERROR, "recvfrom() failed %d errno %d (%s)", bread, errno, strerror(errno));
-#ifdef WIN32
+#ifdef _WIN32
             traceEvent(TRACE_ERROR, "WSAGetLastError(): %u", WSAGetLastError());
 #endif
             return -1;
@@ -2747,11 +2816,11 @@ int fetch_and_eventually_process_data (n2n_edge_t *eee, SOCKET sock,
     } else {
         // tcp
         bread = recvfrom(sock,
-                         pktbuf + *position, *expected - *position, 0 /*flags*/,
+                         (void *)(pktbuf + *position), *expected - *position, 0 /*flags*/,
                         sender_sock, &ss_size);
         if((bread <= 0) && (errno)) {
             traceEvent(TRACE_ERROR, "recvfrom() failed %d errno %d (%s)", bread, errno, strerror(errno));
-#ifdef WIN32
+#ifdef _WIN32
             traceEvent(TRACE_ERROR, "WSAGetLastError(): %u", WSAGetLastError());
 #endif
             supernode_disconnect(eee);
@@ -2811,18 +2880,21 @@ int run_edge_loop (n2n_edge_t *eee) {
     time_t lastTransop = 0;
     time_t last_purge_known = 0;
     time_t last_purge_pending = 0;
+#ifdef HAVE_BRIDGING_SUPPORT
+    time_t last_purge_host = 0;
+#endif
 
     uint16_t expected = sizeof(uint16_t);
     uint16_t position = 0;
     uint8_t  pktbuf[N2N_PKT_BUF_SIZE + sizeof(uint16_t)]; /* buffer + prepended buffer length in case of tcp */
 
-#ifdef WIN32
+#ifdef _WIN32
     struct tunread_arg arg;
     arg.eee = eee;
     HANDLE tun_read_thread = startTunReadThread(&arg);
 #endif
 
-    *eee->keep_running = 1;
+    *eee->keep_running = true;
     update_supernode_reg(eee, time(NULL));
 
     /* Main loop
@@ -2856,7 +2928,7 @@ int run_edge_loop (n2n_edge_t *eee) {
         }
 #endif
 
-#ifndef WIN32
+#ifndef _WIN32
         FD_SET(eee->device.fd, &socket_mask);
         max_sock = max(max_sock, eee->device.fd);
 #endif
@@ -2881,7 +2953,7 @@ int run_edge_loop (n2n_edge_t *eee) {
                 if(0 != fetch_and_eventually_process_data(eee, eee->sock,
                                                           pktbuf, &expected, &position,
                                                           now)) {
-                    *eee->keep_running = 0;
+                    *eee->keep_running = false;
                     break;
                 }
                 if(eee->conf.connect_tcp) {
@@ -2902,7 +2974,7 @@ int run_edge_loop (n2n_edge_t *eee) {
                 if(0 != fetch_and_eventually_process_data(eee, eee->udp_multicast_sock,
                                                           pktbuf, &expected, &position,
                                                           now)) {
-                    *eee->keep_running = 0;
+                    *eee->keep_running = false;
                     break;
                 }
             }
@@ -2916,7 +2988,7 @@ int run_edge_loop (n2n_edge_t *eee) {
                     break;
             }
 
-#ifndef WIN32
+#ifndef _WIN32
             if(FD_ISSET(eee->device.fd, &socket_mask)) {
                 // read an ethernet frame from the TAP socket; write on the IP socket
                 edge_read_from_tap(eee);
@@ -2946,6 +3018,19 @@ int run_edge_loop (n2n_edge_t *eee) {
                        HASH_COUNT(eee->known_peers));
         }
 
+#ifdef HAVE_BRIDGING_SUPPORT
+        if((eee->conf.allow_routing) && (now > last_purge_host + SWEEP_TIME)) {
+            struct host_info *host, *host_tmp;
+            HASH_ITER(hh, eee->known_hosts, host, host_tmp) {
+                if(now > host->last_seen + HOSTINFO_TIMEOUT) {
+                    HASH_DEL(eee->known_hosts, host);
+                    free(host);
+                }
+            }
+            last_purge_host = now;
+        }
+#endif
+
         if((eee->conf.tuntap_ip_mode == TUNTAP_IP_MODE_DHCP) &&
            ((now - lastIfaceCheck) > IFACE_UPDATE_INTERVAL)) {
             uint32_t old_ip = eee->device.ip_addr;
@@ -2969,7 +3054,7 @@ int run_edge_loop (n2n_edge_t *eee) {
 
     send_unregister_super(eee);
 
-#ifdef WIN32
+#ifdef _WIN32
     WaitForSingleObject(tun_read_thread, INFINITE);
 #endif
 
@@ -2999,6 +3084,16 @@ void edge_term (n2n_edge_t * eee) {
     clear_peer_list(&eee->pending_peers);
     clear_peer_list(&eee->known_peers);
     clear_peer_list(&eee->conf.supernodes);
+
+#ifdef HAVE_BRIDGING_SUPPORT
+    if(eee->conf.allow_routing) {
+        struct host_info *host, *host_tmp;
+        HASH_ITER(hh, eee->known_hosts, host, host_tmp) {
+            HASH_DEL(eee->known_hosts, host);
+            free(host);
+        }
+    }
+#endif
 
     eee->transop.deinit(&eee->transop);
     eee->transop_lzo.deinit(&eee->transop_lzo);
@@ -3159,7 +3254,7 @@ int edge_conf_add_supernode (n2n_edge_conf_t *conf, const char *ip_and_port) {
             strncpy(sn->ip_addr, ip_and_port, N2N_EDGE_SN_HOST_SIZE - 1);
             memcpy(&(sn->sock), sock, sizeof(n2n_sock_t));
             memcpy(sn->mac_addr, null_mac, sizeof(n2n_mac_t));
-            sn->purgeable = UNPURGEABLE;
+            sn->purgeable = false;
         }
     }
 
@@ -3177,7 +3272,7 @@ int quick_edge_init (char *device_name, char *community_name,
                      char *encrypt_key, char *device_mac,
                      char *local_ip_address,
                      char *supernode_ip_address_port,
-                     int *keep_on_running) {
+                     bool *keep_on_running) {
 
     tuntap_dev tuntap;
     n2n_edge_t *eee;
@@ -3199,11 +3294,8 @@ int quick_edge_init (char *device_name, char *community_name,
     /* Open the tuntap device */
     if(tuntap_open(&tuntap, device_name, "static",
                    local_ip_address, "255.255.255.0",
-                   device_mac, DEFAULT_MTU
-#ifdef WIN32
-				 , 0
-#endif
-                   ) < 0)
+                   device_mac, DEFAULT_MTU,
+                   0) < 0)
         return(-2);
 
     /* Init edge */

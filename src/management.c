@@ -3,20 +3,26 @@
  *
  */
 
-#include <stdio.h>
-#ifndef WIN32
-#include <sys/socket.h>
-#include <netdb.h>
+
+#include <pearson.h>     // for pearson_hash_64
+#include <stdbool.h>
+#include <stdio.h>       // for snprintf, NULL, size_t
+#include <stdlib.h>      // for strtoul
+#include <string.h>      // for strtok, strlen, strncpy
+#include "management.h"
+#include "n2n.h"         // for TRACE_DEBUG, traceEvent
+
+#ifdef _WIN32
+#include "win32/defs.h"
+#else
+#include <netdb.h>       // for getnameinfo, NI_NUMERICHOST, NI_NUMERICSERV
+#include <sys/socket.h>  // for sendto, sockaddr
 #endif
+
 
 // TODO: move logging defs in their own header and include that
 void setTraceLevel (int level);
 int getTraceLevel ();
-
-#include <pearson.h>
-#include "management.h"
-
-#include "n2n.h"    // for traceEvent and friends
 
 ssize_t send_reply (mgmt_req_t *req, strbuf_t *buf, size_t msg_len) {
     // TODO: better error handling (counters?)
@@ -65,7 +71,7 @@ void mgmt_error (mgmt_req_t *req, strbuf_t *buf, char *msg) {
 void mgmt_stop (mgmt_req_t *req, strbuf_t *buf) {
 
     if(req->type==N2N_MGMT_WRITE) {
-        *req->keep_running = 0;
+        *req->keep_running = false;
     }
 
     send_json_1uint(req, buf, "row", "keep_running", *req->keep_running);
@@ -98,7 +104,7 @@ void mgmt_event_post2 (enum n2n_event_topic topic, int data0, void *data1, mgmt_
 
     char buf_space[100];
     strbuf_t *buf;
-    STRBUF_INIT(buf, buf_space);
+    STRBUF_INIT(buf, buf_space, sizeof(buf_space));
 
     char *tag;
     if(sub->type == N2N_MGMT_SUB) {
@@ -204,7 +210,7 @@ int mgmt_auth (mgmt_req_t *req, char *auth) {
 /*
  * Handle the common and shred parts of the mgmt_req_t initialisation
  */
-void mgmt_req_init2 (mgmt_req_t *req, strbuf_t *buf, char *cmdline) {
+bool mgmt_req_init2 (mgmt_req_t *req, strbuf_t *buf, char *cmdline) {
     char *typechar;
     char *options;
     char *flagstr;
@@ -220,7 +226,7 @@ void mgmt_req_init2 (mgmt_req_t *req, strbuf_t *buf, char *cmdline) {
     if(!typechar) {
         /* should not happen */
         mgmt_error(req, buf, "notype");
-        return;
+        return false;
     }
     if(*typechar == 'r') {
         req->type=N2N_MGMT_READ;
@@ -230,20 +236,20 @@ void mgmt_req_init2 (mgmt_req_t *req, strbuf_t *buf, char *cmdline) {
         req->type=N2N_MGMT_SUB;
     } else {
         mgmt_error(req, buf, "badtype");
-        return;
+        return false;
     }
 
     /* Extract the tag to use in all reply packets */
     options = strtok(NULL, " \r\n");
     if(!options) {
         mgmt_error(req, buf, "nooptions");
-        return;
+        return false;
     }
 
     req->argv0 = strtok(NULL, " \r\n");
     if(!req->argv0) {
         mgmt_error(req, buf, "nocmd");
-        return;
+        return false;
     }
 
     /*
@@ -275,6 +281,8 @@ void mgmt_req_init2 (mgmt_req_t *req, strbuf_t *buf, char *cmdline) {
 
     if(!mgmt_auth(req, auth)) {
         mgmt_error(req, buf, "badauth");
-        return;
+        return false;
     }
+
+    return true;
 }

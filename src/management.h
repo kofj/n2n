@@ -8,9 +8,19 @@
 #ifndef MANAGEMENT_H
 #define MANAGEMENT_H 1
 
-#include <n2n_typedefs.h>   // For the n2n_edge_t and n2n_sn_t defs
-
+#include <n2n_typedefs.h>  // For the n2n_edge_t and n2n_sn_t defs
+#include <stdbool.h>
+#include <stddef.h>        // for size_t
+#include <stdint.h>        // for uint64_t
+#include <sys/types.h>     // for ssize_t
+#include "n2n_define.h"    // for n2n_event_topic
 #include "strbuf.h"
+
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>    // for sockaddr, sockaddr_storage, socklen_t
+#endif
 
 enum n2n_mgmt_type {
     N2N_MGMT_UNKNOWN = 0,
@@ -33,7 +43,7 @@ typedef struct mgmt_req {
     n2n_sn_t *sss;
     n2n_edge_t *eee;
     int mgmt_sock;                  // socket replies come from
-    int *keep_running;
+    bool *keep_running;
     uint64_t mgmt_password_hash;
     enum n2n_mgmt_type type;
     char *argv0;
@@ -99,6 +109,6 @@ void mgmt_event_post2 (enum n2n_event_topic topic, int data0, void *data1, mgmt_
 void mgmt_help_row (mgmt_req_t *req, strbuf_t *buf, char *cmd, char *help);
 void mgmt_help_events_row (mgmt_req_t *req, strbuf_t *buf, mgmt_req_t *sub, char *cmd, char *help);
 int mgmt_auth (mgmt_req_t *req, char *auth);
-void mgmt_req_init2 (mgmt_req_t *req, strbuf_t *buf, char *cmdline);
+bool mgmt_req_init2 (mgmt_req_t *req, strbuf_t *buf, char *cmdline);
 
 #endif

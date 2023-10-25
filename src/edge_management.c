@@ -16,11 +16,32 @@
  *
  */
 
-#include "n2n.h"
-#include "edge_utils_win32.h"
+#include "n2n.h"           // for n2n_edge_t, peer_info, getTraceLevel, N2N_...
+// FIXME: if this headers is sorted alphabetically, the test_integration_edge
+// fails with what looks like a struct rearrangement involving eee->stats
 
-#include "strbuf.h"
-#include "management.h"
+#include <errno.h>         // for errno
+#include <stdbool.h>
+#include <stdint.h>        // for uint32_t
+#include <stdio.h>         // for snprintf, size_t, NULL
+#include <string.h>        // for memcmp, memcpy, strerror, strncpy
+#include <sys/types.h>     // for ssize_t
+#include <time.h>          // for time, time_t
+#include "config.h"        // for PACKAGE_VERSION
+#include "management.h"    // for mgmt_req_t, send_reply, send_json_1str
+#include "n2n_define.h"    // for N2N_PKT_BUF_SIZE, N2N_EVENT_DEBUG, N2N_EVE...
+#include "n2n_typedefs.h"  // for n2n_edge_t, peer_info, n2n_edge_conf_t
+#include "sn_selection.h"  // for sn_selection_criterion_str, selection_crit...
+#include "strbuf.h"        // for strbuf_t, STRBUF_INIT
+#include "uthash.h"        // for UT_hash_handle, HASH_ITER
+
+#ifdef _WIN32
+#include "win32/defs.h"
+#else
+#include <arpa/inet.h>     // for inet_ntoa
+#include <netinet/in.h>    // for in_addr, htonl, in_addr_t
+#include <sys/socket.h>    // for sendto, recvfrom, sockaddr_storage
+#endif
 
 size_t event_debug (strbuf_t *buf, char *tag, int data0, void *data1) {
     traceEvent(TRACE_DEBUG, "Unexpected call to event_debug");
@@ -358,9 +379,12 @@ static void handleMgmtJson (mgmt_req_t *req, char *udp_buf, const int recvlen) {
     traceEvent(TRACE_DEBUG, "mgmt json %s", cmdlinebuf);
 
     /* we reuse the buffer already on the stack for all our strings */
-    STRBUF_INIT(buf, udp_buf);
+    STRBUF_INIT(buf, udp_buf, N2N_SN_PKTBUF_SIZE);
 
-    mgmt_req_init2(req, buf, (char *)&cmdlinebuf);
+    if(!mgmt_req_init2(req, buf, (char *)&cmdlinebuf)) {
+        // if anything failed during init
+        return;
+    }
 
     if(req->type == N2N_MGMT_SUB) {
         int handler;
@@ -453,7 +477,7 @@ void readFromMgmtSocket (n2n_edge_t *eee) {
 
     if((0 == memcmp(udp_buf, "help", 4)) || (0 == memcmp(udp_buf, "?", 1))) {
         strbuf_t *buf;
-        STRBUF_INIT(buf, &udp_buf);
+        STRBUF_INIT(buf, &udp_buf, sizeof(udp_buf));
         msg_len = snprintf(buf->str, buf->size,
                            "Help for edge management console:\n"
                            "\tstop    | Gracefully exit edge\n"
@@ -472,7 +496,7 @@ void readFromMgmtSocket (n2n_edge_t *eee) {
 
     if(0 == memcmp(udp_buf, "stop", 4)) {
         traceEvent(TRACE_NORMAL, "stop command received");
-        *eee->keep_running = 0;
+        *eee->keep_running = false;
         return;
     }
 
@@ -482,7 +506,7 @@ void readFromMgmtSocket (n2n_edge_t *eee) {
         traceEvent(TRACE_NORMAL, "+verb traceLevel=%u", (unsigned int) getTraceLevel());
 
         strbuf_t *buf;
-        STRBUF_INIT(buf, &udp_buf);
+        STRBUF_INIT(buf, &udp_buf, sizeof(udp_buf));
         msg_len = snprintf(buf->str, buf->size,
                            "> +OK traceLevel=%u\n", (unsigned int) getTraceLevel());
 
@@ -493,7 +517,7 @@ void readFromMgmtSocket (n2n_edge_t *eee) {
 
     if(0 == memcmp(udp_buf, "-verb", 5)) {
         strbuf_t *buf;
-        STRBUF_INIT(buf, &udp_buf);
+        STRBUF_INIT(buf, &udp_buf, sizeof(udp_buf));
 
         if(getTraceLevel() > 0) {
             setTraceLevel(getTraceLevel() - 1);
@@ -586,7 +610,7 @@ void readFromMgmtSocket (n2n_edge_t *eee) {
         msg_len += snprintf((char *) (udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                             "%-19s %1s%1s | %-17s | %-21s | %-15s | %9s | %10s\n",
                             peer->version,
-                            (peer->purgeable == UNPURGEABLE) ? "l" : "",
+                            (peer->purgeable) ? "" : "l",
                             (peer == eee->curr_sn) ? (eee->sn_wait ? "." : "*" ) : "",
                             is_null_mac(peer->mac_addr) ? "" : macaddr_str(mac_buf, peer->mac_addr),
                             sock_to_cstr(sockbuf, &(peer->sock)),

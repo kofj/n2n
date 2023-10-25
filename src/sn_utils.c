@@ -16,7 +16,40 @@
  *
  */
 
-#include "n2n.h"
+
+#include <errno.h>              // for errno, EAFNOSUPPORT
+#include <stdbool.h>
+#include <stdint.h>             // for uint8_t, uint32_t, uint16_t, uint64_t
+#include <stdio.h>              // for sscanf, snprintf, fclose, fgets, fopen
+#include <stdlib.h>             // for free, calloc, getenv
+#include <string.h>             // for memcpy, NULL, memset, size_t, strerror
+#include <sys/param.h>          // for MAX
+#include <sys/time.h>           // for timeval
+#include <sys/types.h>          // for ssize_t
+#include <time.h>               // for time_t, time
+#include "auth.h"               // for ascii_to_bin, calculate_dynamic_key
+#include "config.h"             // for PACKAGE_VERSION
+#include "header_encryption.h"  // for packet_header_encrypt, packet_header_...
+#include "n2n.h"                // for sn_community, n2n_sn_t, peer_info
+#include "n2n_regex.h"          // for re_matchp, re_compile
+#include "n2n_wire.h"           // for encode_buf, encode_PEER_INFO, encode_...
+#include "pearson.h"            // for pearson_hash_128, pearson_hash_32
+#include "portable_endian.h"    // for be16toh, htobe16
+#include "random_numbers.h"     // for n2n_rand, n2n_rand_sqr, n2n_seed, n2n...
+#include "sn_selection.h"       // for sn_selection_criterion_gather_data
+#include "speck.h"              // for speck_128_encrypt, speck_context_t
+#include "uthash.h"             // for UT_hash_handle, HASH_ITER, HASH_DEL
+
+#ifdef _WIN32
+#include "win32/defs.h"
+#else
+#include <arpa/inet.h>          // for inet_addr, inet_ntoa
+#include <netinet/in.h>         // for ntohl, in_addr_t, sockaddr_in, INADDR...
+#include <netinet/tcp.h>        // for TCP_NODELAY
+#include <sys/select.h>         // for FD_ISSET, FD_SET, select, FD_SETSIZE
+#include <sys/socket.h>         // for recvfrom, shutdown, sockaddr_storage
+#endif
+
 
 #define HASH_FIND_COMMUNITY(head, name, out) HASH_FIND_STR(head, name, out)
 
@@ -379,7 +412,7 @@ int load_allowed_sn_community (n2n_sn_t *sss) {
         if(comm != NULL) {
             comm_init(comm, cmn_str);
             /* loaded from file, this community is unpurgeable */
-            comm->purgeable = UNPURGEABLE;
+            comm->purgeable = false;
             /* we do not know if header encryption is used in this community,
              * first packet will show. just in case, setup the key. */
             comm->header_encryption = HEADER_ENCRYPTION_UNKNOWN;
@@ -478,7 +511,7 @@ static ssize_t sendto_fd (n2n_sn_t *sss,
     if((sent <= 0) && (errno)) {
         char * c = strerror(errno);
         traceEvent(TRACE_ERROR, "sendto failed (%d) %s", errno, c);
-#ifdef WIN32
+#ifdef _WIN32
         traceEvent(TRACE_ERROR, "WSAGetLastError(): %u", WSAGetLastError());
 #endif
         // if the erroneous connection is tcp, i.e. not the regular sock...
@@ -532,7 +565,7 @@ static ssize_t sendto_sock(n2n_sn_t *sss,
     // if the connection is tcp, i.e. not the regular sock...
     if((socket_fd >= 0) && (socket_fd != sss->sock)) {
         value = 1; /* value should still be set to 1 */
-        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+        setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, (void *)&value, sizeof(value));
 #ifdef LINUX
         value = 0;
         setsockopt(socket_fd, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
@@ -734,7 +767,7 @@ int sn_init_defaults (n2n_sn_t *sss) {
 
     char *tmp_string;
 
-#ifdef WIN32
+#ifdef _WIN32
     initWin32();
 #endif
 
@@ -767,7 +800,7 @@ int sn_init_defaults (n2n_sn_t *sss) {
         sss->federation->community[N2N_COMMUNITY_SIZE - 1] = '\0';
         /* enable the flag for federation */
         sss->federation->is_federation = IS_FEDERATION;
-        sss->federation->purgeable = UNPURGEABLE;
+        sss->federation->purgeable = false;
         /* header encryption enabled by default */
         sss->federation->header_encryption = HEADER_ENCRYPTION_ENABLED;
         /*setup the encryption key */
@@ -870,7 +903,7 @@ void sn_term (n2n_sn_t *sss) {
 
     if(sss->community_file)
         free(sss->community_file);
-#ifdef WIN32
+#ifdef _WIN32
     destroyWin32();
 #endif
 }
@@ -1075,6 +1108,7 @@ static int update_edge (n2n_sn_t *sss,
         if(handle_remote_auth(sss, &(reg->auth), answer_auth, comm) == 0) {
             if(skip_add == SN_ADD) {
                 scan = (struct peer_info *) calloc(1, sizeof(struct peer_info)); /* deallocated in purge_expired_nodes */
+                scan->purgeable = true;
                 memcpy(&(scan->mac_addr), reg->edgeMac, sizeof(n2n_mac_t));
                 scan->dev_addr.net_addr = reg->dev_addr.net_addr;
                 scan->dev_addr.net_bitlen = reg->dev_addr.net_bitlen;
@@ -1111,6 +1145,9 @@ static int update_edge (n2n_sn_t *sss,
         /* Known */
         if(auth_edge(&(scan->auth), &(reg->auth), answer_auth, comm) == 0) {
             if(!sock_equal(sender_sock, &(scan->sock))) {
+                scan->dev_addr.net_addr = reg->dev_addr.net_addr;
+                scan->dev_addr.net_bitlen = reg->dev_addr.net_bitlen;
+                memcpy((char*)scan->dev_desc, reg->dev_desc, N2N_DESC_SIZE);
                 memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
                 scan->socket_fd = socket_fd;
                 scan->last_cookie = reg->cookie;
@@ -1446,7 +1483,7 @@ static int purge_expired_communities (n2n_sn_t *sss,
             }
         }
 
-        if((comm->edges == NULL) && (comm->purgeable == PURGEABLE)) {
+        if((comm->edges == NULL) && (comm->purgeable)) {
             traceEvent(TRACE_INFO, "purging idle community %s", comm->community);
             if(NULL != comm->header_encryption_ctx_static) {
                 /* this should not happen as 'purgeable' and thus only communities w/o encrypted header here */
@@ -1904,7 +1941,7 @@ static int process_udp (n2n_sn_t * sss,
                     comm->header_encryption_ctx_static = NULL;
                     comm->header_encryption_ctx_dynamic = NULL;
                     /* ... and also are purgeable during periodic purge */
-                    comm->purgeable = PURGEABLE;
+                    comm->purgeable = true;
                     comm->number_enc_packets = 0;
                     HASH_ADD_STR(sss->communities, community, comm);
 
@@ -2607,17 +2644,17 @@ int run_sn_loop (n2n_sn_t *sss) {
                                  sender_sock, &ss_size);
 
                 if((bread < 0)
-#ifdef WIN32
+#ifdef _WIN32
                    && (WSAGetLastError() != WSAECONNRESET)
 #endif
                   ) {
                     /* For UDP bread of zero just means no data (unlike TCP). */
                     /* The fd is no good now. Maybe we lost our interface. */
                     traceEvent(TRACE_ERROR, "recvfrom() failed %d errno %d (%s)", bread, errno, strerror(errno));
-#ifdef WIN32
+#ifdef _WIN32
                     traceEvent(TRACE_ERROR, "WSAGetLastError(): %u", WSAGetLastError());
 #endif
-                    *sss->keep_running = 0;
+                    *sss->keep_running = false;
                     break;
                 }
 
@@ -2653,7 +2690,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                     if(bread <= 0) {
                         traceEvent(TRACE_INFO, "closing tcp connection to [%s]", sock_to_cstr(sockbuf, (n2n_sock_t*)sender_sock));
                         traceEvent(TRACE_DEBUG, "recvfrom() returns %d and sees errno %d (%s)", bread, errno, strerror(errno));
-#ifdef WIN32
+#ifdef _WIN32
                         traceEvent(TRACE_DEBUG, "WSAGetLastError(): %u", WSAGetLastError());
 #endif
                         close_tcp_connection(sss, conn);
@@ -2735,7 +2772,7 @@ int run_sn_loop (n2n_sn_t *sss) {
                 // REVISIT: should we error out if ss_size returns bigger than before? can this ever happen?
                 if(bread <= 0) {
                     traceEvent(TRACE_ERROR, "recvfrom() failed %d errno %d (%s)", bread, errno, strerror(errno));
-                    *sss->keep_running = 0;
+                    *sss->keep_running = false;
                     break;
                 }
 
